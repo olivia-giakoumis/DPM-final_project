@@ -1,12 +1,21 @@
 """
 ECSE 211 Final Project - Snow removal robot.
 
+Sensors:
+    - Front touch sensor:     bump detection (a press = wall straight ahead).
+    - Side ultrasonic sensor: measures the wall beside the robot.
+    - Two color sensors (left and right, looking down): detect the black grid
+      lines to square the heading and reset x or y.
+
 Phase 1 (mapping):
     1. Start at the origin (0, 0), facing +y.
     2. Drive to the tile just outside the street entrance (the s1-s2 edge).
-    3. Walk the street one tile at a time, using the ultrasonic sensor to find
-       the walls (boxes), until the street ends (we leave the corridor, hit a
-       dead end, or reach the map edge).
+    3. Walk the street one tile at a time:
+         - the side ultrasonic checks the wall on that side,
+         - driving forward checks the front: a bump means a wall,
+         - every grid line crossed corrects the odometry.
+       Stop when the street ends (we leave the corridor, hit a dead end, or
+       reach the map edge).
     4. Retrace the exact path back to the origin.
     5. Save the street map to street_map.json and wait for the facilitator
        before Phase 2.
@@ -23,7 +32,10 @@ Coordinate conventions:
     - Heading: 0 deg = +y, 90 deg = +x, increasing clockwise.
 """
 
-from utils.brick import Motor, EV3UltrasonicSensor, reset_brick, wait_ready_sensors
+from utils.brick import (
+    Motor, EV3ColorSensor, EV3UltrasonicSensor, TouchSensor,
+    reset_brick, wait_ready_sensors,
+)
 import json
 import math
 import re
@@ -36,7 +48,13 @@ import time
 LEFT_MOTOR_PORT = "A"
 RIGHT_MOTOR_PORT = "B"
 CONVEYOR_MOTOR_PORT = "C"
-ULTRASONIC_PORT = 2          # front-facing ultrasonic sensor
+LEFT_COLOR_PORT = 1
+RIGHT_COLOR_PORT = 2
+ULTRASONIC_PORT = 3
+TOUCH_PORT = 4
+
+# Which side the ultrasonic sensor faces: -1 = left, +1 = right.
+US_SIDE = -1
 
 # Your drive motors are mounted backwards: a negative dps drives forward.
 MOTOR_DIR = -1
@@ -45,7 +63,9 @@ MOTOR_DIR = -1
 TILE = 30.48
 RADIUS = 2.13                # wheel radius
 TRACK_WIDTH = 14.5           # distance between the two wheels
-US_OFFSET = 8.0              # wheel axle centre -> ultrasonic sensor face (forward)
+US_SIDE_OFFSET = 8.0         # robot centre -> ultrasonic sensor face (sideways)
+COLOR_OFFSET = 3.0           # how far the color sensors sit AHEAD of the wheel axle
+BUMPER_OFFSET = 14.0         # robot centre -> front of the touch sensor/bumper
 
 # Map bounds (in tiles). x intersections in [-1, 8], y in [-1, 4].
 MIN_TILE_X, MAX_TILE_X = -1, 7
@@ -54,7 +74,7 @@ MIN_TILE_Y, MAX_TILE_Y = -1, 3
 START_HEADING = 0.0          # robot is placed at the origin facing +y
 
 # Motion tuning
-DRIVE_DPS = 320              # cruise wheel speed
+DRIVE_DPS = 300              # cruise wheel speed
 DRIVE_MIN_DPS = 90           # speed near the end of a move
 SLOWDOWN_DIST = 8.0          # cm before target where we start slowing down
 HEADING_KP = 6.0             # dps of correction per degree of heading error
@@ -66,12 +86,18 @@ MOVE_TIMEOUT = 15.0          # s
 TURN_TIMEOUT = 6.0           # s
 LOOP_DT = 0.01
 
-# Sensing
-# From a tile centre, a box in the neighbouring tile is ~TILE/2 - US_OFFSET
-# away (~7 cm); an open neighbour gives > 1.5*TILE - US_OFFSET (~38 cm).
-WALL_THRESHOLD = TILE - US_OFFSET          # ~22 cm, halfway between the two
+# Grid-line correction
+LINE_THRESHOLD = 200         # red reading below this = black line (same as your old code)
+SQUARE_DPS = 80              # speed of the lagging wheel while squaring on a line
+SQUARE_TIMEOUT = 1.5         # s to wait for the second sensor to reach the line
+SQUARE_MAX_ANGLE = 15.0      # deg; ignore a correction bigger than this
+LINE_SNAP_TOLERANCE = 7.0    # cm; only snap to a line this close to where we think we are
+
+# Wall sensing
+# From a tile centre, a box in the neighbouring tile is ~TILE/2 - US_SIDE_OFFSET
+# away (~7 cm); an open neighbour gives > 1.5*TILE - US_SIDE_OFFSET (~38 cm).
+WALL_THRESHOLD = TILE - US_SIDE_OFFSET     # ~22 cm, halfway between the two
 US_MAX_RANGE = 255.0
-OBSTACLE_STOP_DIST = 10.0    # stop if something is this close while approaching
 MAX_POSITION_CORRECTION = 8.0  # ignore wall-based corrections larger than this
 
 # Time budget (phase must finish in 120 s, including the trip home)
@@ -83,13 +109,19 @@ MAP_FILE = "street_map.json"
 # Heading -> (dx, dy) in tiles
 DIRS = {0: (0, 1), 90: (1, 0), 180: (0, -1), 270: (-1, 0)}
 
+# Results of a move
+OK, BUMP, FAIL = "ok", "bump", "fail"
+
 # ---------------------------------------------------------------------------
 # Hardware setup
 # ---------------------------------------------------------------------------
 leftmotor = Motor(LEFT_MOTOR_PORT)
 rightmotor = Motor(RIGHT_MOTOR_PORT)
 conveyor_motor = Motor(CONVEYOR_MOTOR_PORT)
+left_color = EV3ColorSensor(LEFT_COLOR_PORT)
+right_color = EV3ColorSensor(RIGHT_COLOR_PORT)
 us_sensor = EV3UltrasonicSensor(ULTRASONIC_PORT)
+touch_sensor = TouchSensor(TOUCH_PORT)
 
 wait_ready_sensors()
 
@@ -131,6 +163,11 @@ def get_shortest_angle(target_heading, current_heading):
     return (target_heading - current_heading + 180) % 360 - 180
 
 
+def nearest_axis(heading):
+    """Round a heading to 0, 90, 180 or 270."""
+    return int(round(heading / 90.0)) % 4 * 90
+
+
 def update_odometer():
     """Update robot position and heading using wheel encoders."""
     global x, y, theta, prev_left_encoder, prev_right_encoder
@@ -157,8 +194,23 @@ def print_pose(prefix=""):
     print(f"{prefix}X: {x:7.2f} cm | Y: {y:7.2f} cm | Theta: {theta:6.1f} deg")
 
 
-def read_distance(samples=5):
-    """Median-filtered ultrasonic distance in cm (US_MAX_RANGE if no echo)."""
+# ---------------------------------------------------------------------------
+# Sensors
+# ---------------------------------------------------------------------------
+def on_line(sensor):
+    """True if this color sensor is over a black grid line."""
+    value = sensor.get_value()
+    if not value or value[0] is None:
+        return False
+    return value[0] < LINE_THRESHOLD
+
+
+def bumped():
+    return bool(touch_sensor.is_pressed())
+
+
+def read_side_distance(samples=5):
+    """Median-filtered side ultrasonic distance in cm (US_MAX_RANGE if no echo)."""
     values = []
     for _ in range(samples):
         value = us_sensor.get_value()
@@ -169,6 +221,93 @@ def read_distance(samples=5):
         return US_MAX_RANGE
     values.sort()
     return values[len(values) // 2]
+
+
+# ---------------------------------------------------------------------------
+# Odometry corrections
+# ---------------------------------------------------------------------------
+def axis_of(heading):
+    """('x' or 'y', +1 or -1) for an axis-aligned heading."""
+    return {0: ("y", 1), 90: ("x", 1), 180: ("y", -1), 270: ("x", -1)}[heading]
+
+
+def snap_to_grid_line(heading, offset_ahead):
+    """
+    A point `offset_ahead` cm in front of the robot centre is on a grid line.
+    Snap the robot's position along `heading` so that point lies on the
+    nearest line.
+    """
+    global x, y
+    axis, sign = axis_of(heading)
+    centre = x if axis == "x" else y
+    point = centre + sign * offset_ahead
+    line = round(point / TILE) * TILE
+    if abs(line - point) > LINE_SNAP_TOLERANCE:
+        return
+    new_centre = line - sign * offset_ahead
+    if axis == "x":
+        x = new_centre
+    else:
+        y = new_centre
+
+
+def square_on_line(first_side, heading):
+    """
+    One color sensor just hit a line. Stop that wheel and creep the other one
+    forward until its sensor reaches the line too. The robot is then square
+    to the line: reset the heading and the position along it.
+    """
+    global theta
+    other_sensor = right_color if first_side == "left" else left_color
+    if first_side == "left":
+        set_wheels(0, SQUARE_DPS)
+    else:
+        set_wheels(SQUARE_DPS, 0)
+
+    start = time.time()
+    reached = False
+    while time.time() - start < SQUARE_TIMEOUT:
+        update_odometer()
+        if on_line(other_sensor):
+            reached = True
+            break
+        if abs(get_shortest_angle(heading, theta)) > SQUARE_MAX_ANGLE:
+            break
+        time.sleep(LOOP_DT)
+    stop_motors()
+    update_odometer()
+
+    if reached and abs(get_shortest_angle(heading, theta)) <= SQUARE_MAX_ANGLE:
+        theta = float(heading)
+        snap_to_grid_line(heading, COLOR_OFFSET)
+
+
+def correct_from_bump(heading):
+    """The bumper is touching a box: the box face is on a grid line."""
+    snap_to_grid_line(heading, BUMPER_OFFSET)
+
+
+def correct_from_side_wall(tile, direction, distance):
+    """Use a side ultrasonic reading to fix odometry across the street."""
+    global x, y
+    cx, cy = tile_center(tile)
+    centre_to_wall = distance + US_SIDE_OFFSET
+    half = TILE / 2.0
+
+    if direction == 0:
+        new, old, axis = cy + half - centre_to_wall, y, "y"
+    elif direction == 180:
+        new, old, axis = cy - half + centre_to_wall, y, "y"
+    elif direction == 90:
+        new, old, axis = cx + half - centre_to_wall, x, "x"
+    else:
+        new, old, axis = cx - half + centre_to_wall, x, "x"
+
+    if abs(new - old) <= MAX_POSITION_CORRECTION:
+        if axis == "x":
+            x = new
+        else:
+            y = new
 
 
 # ---------------------------------------------------------------------------
@@ -199,35 +338,60 @@ def turn_to(target_heading):
         update_odometer()
 
 
-def drive_to(target, check_obstacles=False):
+def drive_to(target, reverse=False):
     """
-    Drive straight to `target` (cm), assuming we already face it.
-    Holds the heading toward the target. Returns False if blocked/timed out.
+    Drive straight to `target` (cm). We must already face it (or face away
+    from it when reverse=True).
+
+    Forward moves stop on a bump and square up on every grid line crossed.
+    Returns OK, BUMP or FAIL.
     """
+    global theta
     tx, ty = target
-    start_heading = math.radians(theta)
+    travel_heading = (theta + (180 if reverse else 0)) % 360
+    travel_rad = math.radians(travel_heading)
+    axis_heading = nearest_axis(theta)
     start = time.time()
-    last_us_check = 0.0
+
+    # Only react to a sensor going from floor to line, so starting on a line
+    # does not count as a crossing.
+    left_was_on = on_line(left_color)
+    right_was_on = on_line(right_color)
 
     try:
         while True:
             update_odometer()
             dx, dy = tx - x, ty - y
-            # Remaining distance measured along the original direction of travel
-            along = dx * math.sin(start_heading) + dy * math.cos(start_heading)
+            # Remaining distance measured along the direction of travel
+            along = dx * math.sin(travel_rad) + dy * math.cos(travel_rad)
             if along <= 0.5:
-                return True
+                return OK
 
             if time.time() - start > MOVE_TIMEOUT:
                 print("Move timed out!")
-                return False
+                return FAIL
 
-            if check_obstacles and time.time() - last_us_check > 0.1:
-                last_us_check = time.time()
-                d = us_sensor.get_value()
-                if d is not None and 0 < d < OBSTACLE_STOP_DIST and along > OBSTACLE_STOP_DIST:
-                    print(f"Obstacle ahead ({d:.0f} cm)!")
-                    return False
+            if not reverse:
+                if bumped():
+                    stop_motors()
+                    print("Bump!")
+                    return BUMP
+
+                left_now = on_line(left_color)
+                right_now = on_line(right_color)
+                left_hit = left_now and not left_was_on
+                right_hit = right_now and not right_was_on
+                left_was_on, right_was_on = left_now, right_now
+
+                if (left_hit or right_hit) and along > 3.0:
+                    if left_hit and right_hit:
+                        stop_motors()
+                        theta = float(axis_heading)
+                        snap_to_grid_line(axis_heading, COLOR_OFFSET)
+                    else:
+                        square_on_line("left" if left_hit else "right", axis_heading)
+                    left_was_on = right_was_on = True
+                    continue
 
             speed = DRIVE_DPS
             if along < SLOWDOWN_DIST:
@@ -236,10 +400,13 @@ def drive_to(target, check_obstacles=False):
             correction = 0.0
             if along > 3.0:   # bearing gets noisy right at the target
                 bearing = math.degrees(math.atan2(dx, dy)) % 360
-                error = get_shortest_angle(bearing, theta)
+                error = get_shortest_angle(bearing, travel_heading)
                 correction = clamp(error * HEADING_KP, -speed / 2, speed / 2)
 
-            set_wheels(speed + correction, speed - correction)
+            if reverse:
+                set_wheels(-speed + correction, -speed - correction)
+            else:
+                set_wheels(speed + correction, speed - correction)
             time.sleep(LOOP_DT)
     finally:
         stop_motors()
@@ -247,16 +414,21 @@ def drive_to(target, check_obstacles=False):
         update_odometer()
 
 
-def go_to(target, check_obstacles=False, record=True):
-    """Turn toward and drive to a point in cm."""
+def go_to(target, record=True):
+    """Turn toward and drive to a point in cm. Returns OK, BUMP or FAIL."""
     dx, dy = target[0] - x, target[1] - y
     if math.hypot(dx, dy) < 1.0:
-        return True
+        return OK
     turn_to(math.degrees(math.atan2(dx, dy)))
-    ok = drive_to(target, check_obstacles)
-    if ok and record:
+    result = drive_to(target)
+    if result == OK and record:
         trail.append((float(target[0]), float(target[1])))
-    return ok
+    return result
+
+
+def back_up_to(point):
+    """Reverse in a straight line to `point` without turning around."""
+    return drive_to(point, reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +460,7 @@ def street_entrance(s1, s2):
     Return (approach_tile, entry_tile, heading_in).
     s1-s2 is a one-tile edge; the street is on one side of it. We approach
     from the side that is closer to the origin (the open side), and verify
-    with the sensor once inside.
+    with the sensors once inside.
     """
     (x1, y1), (x2, y2) = s1, s2
     if x1 == x2 and abs(y1 - y2) == 1:          # vertical edge
@@ -314,57 +486,60 @@ def street_entrance(s1, s2):
 
 
 # ---------------------------------------------------------------------------
-# Sensing walls
+# Wall sensing
 # ---------------------------------------------------------------------------
-def correct_position_from_wall(tile, heading, distance):
-    """Use a measured wall distance to fix odometry along that axis."""
-    global x, y
-    cx, cy = tile_center(tile)
-    centre_to_wall = distance + US_OFFSET
-    half = TILE / 2.0
-
-    if heading == 0:
-        new, old, axis = cy + half - centre_to_wall, y, "y"
-    elif heading == 180:
-        new, old, axis = cy - half + centre_to_wall, y, "y"
-    elif heading == 90:
-        new, old, axis = cx + half - centre_to_wall, x, "x"
-    else:
-        new, old, axis = cx - half + centre_to_wall, x, "x"
-
-    if abs(new - old) <= MAX_POSITION_CORRECTION:
-        if axis == "x":
-            x = new
-        else:
-            y = new
+NAMES = {0: "+y", 90: "+x", 180: "-y", 270: "-x"}
 
 
-def probe(tile, heading):
-    """Face `heading` and return True if there is a wall in that neighbour."""
-    turn_to(heading)
-    distance = read_distance()
+def probe_side(tile, direction):
+    """
+    Point the side ultrasonic at `direction` (turning if needed) and return
+    True if the neighbouring tile that way is a wall.
+    """
+    turn_to(direction - US_SIDE * 90)
+    distance = read_side_distance()
     is_wall = distance < WALL_THRESHOLD
     if is_wall:
-        correct_position_from_wall(tile, heading, distance)
-    names = {0: "+y", 90: "+x", 180: "-y", 270: "-x"}
-    print(f"  {names[heading]}: {distance:5.1f} cm -> {'WALL' if is_wall else 'open'}")
+        correct_from_side_wall(tile, direction, distance)
+    print(f"  {NAMES[direction]}: {distance:5.1f} cm -> {'WALL' if is_wall else 'open'}")
     return is_wall
+
+
+def try_move(tile, next_tile):
+    """
+    Drive from the centre of `tile` to the centre of `next_tile`.
+    On a bump, correct the odometry, back up to the centre of `tile` and
+    return BUMP (= wall in that direction).
+    """
+    heading = heading_between(tile, next_tile)
+    turn_to(heading)
+    result = go_to(tile_center(next_tile))
+    if result == BUMP:
+        correct_from_bump(heading)
+        back_up_to(tile_center(tile))
+        print(f"  {NAMES[heading]}: bump -> WALL")
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Phase 1: mapping
 # ---------------------------------------------------------------------------
 def travel_to_approach(approach_tile):
-    """Go from the current position to the approach tile with an L-shaped path."""
+    """
+    Go from the current position to the approach tile with an L-shaped path.
+    If the bumper hits something, go back and try the other order.
+    """
     target = tile_center(approach_tile)
     start = (x, y)
 
     for first_axis in ("y", "x"):
         corner = (start[0], target[1]) if first_axis == "y" else (target[0], start[1])
         print(f"Approach path ({first_axis} first) via {corner}")
-        if go_to(corner, check_obstacles=True) and go_to(target, check_obstacles=True):
+        if go_to(corner) == OK and go_to(target) == OK:
             return True
         print("Path blocked, going back to try the other order...")
+        back_up_to((x - 5 * math.sin(math.radians(theta)),
+                    y - 5 * math.cos(math.radians(theta))))
         go_to(start, record=False)
         # Drop anything recorded for the failed attempt
         while len(trail) > 1 and trail[-1] != start:
@@ -378,13 +553,21 @@ def map_street(entry_tile, heading, deadline):
     facing `heading`). Returns (street_tiles, exit_tile, wrong_side_flag).
 
     Each street tile entry: {"tile": (i, j), "walls": {heading: bool}}
+
+    The street is one tile wide with no branches, so on every tile:
+      - side open and other side open -> we left the street (exit)
+      - side open                     -> the street turns toward the side
+      - side wall: drive forward; no bump -> straight on
+                                  bump    -> turn to the other side;
+                                             bump again -> dead end
     """
     street = []
     visited = set()
-    tile = entry_tile
 
-    if not go_to(tile_center(tile)):
+    if go_to(tile_center(entry_tile)) != OK:
+        print("Could not enter the street.")
         return street, None, False
+    tile = entry_tile
 
     while True:
         if time.time() > deadline:
@@ -393,54 +576,61 @@ def map_street(entry_tile, heading, deadline):
 
         print(f"\nTile {tile}:")
         visited.add(tile)
-        front = heading
-        left = (heading - 90) % 360
-        right = (heading + 90) % 360
+        side = (heading + US_SIDE * 90) % 360        # where the ultrasonic points
+        other = (heading - US_SIDE * 90) % 360
         walls = {}
 
-        walls[front] = probe(tile, front)
-        walls[left] = probe(tile, left)
-        if not walls[front] and walls[left]:
-            # Straight corridor: the street is 1 tile wide, so the right side
-            # must be a wall too. Skip probing it to save time.
-            walls[right] = True
+        walls[side] = probe_side(tile, side)
+
+        if not walls[side]:
+            # Sensor side is open: check the other side (turn around).
+            walls[other] = probe_side(tile, other)
+            if not walls[other]:
+                if not street:
+                    print("No walls at the first tile: we entered from the wrong side.")
+                    return street, None, True
+                print("Left the street (no side walls).")
+                return street, tile, False
+            walls[heading] = True   # 1 tile wide, no branches: the street turns
+            street.append({"tile": tile, "walls": walls})
+            candidates = [side]
         else:
-            walls[right] = probe(tile, right)
+            candidates = [heading, other]
 
-        # Both sides open -> we are no longer inside the corridor.
-        if not walls[left] and not walls[right]:
-            if not street:
-                print("No walls at the first tile: we entered from the wrong side.")
-                return street, None, True
-            print("Left the street (no side walls).")
-            return street, tile, False
-
-        street.append({"tile": tile, "walls": {str(h): w for h, w in walls.items()}})
-
-        # Choose where to go next: straight, else left, else right.
-        next_heading = None
-        for h in (front, left, right):
-            if not walls[h]:
-                next_heading = h
+        # Try the open directions in order. A bump means that way is a wall.
+        moved = False
+        for direction in candidates:
+            next_tile = neighbour(tile, direction)
+            if not tile_in_bounds(next_tile):
+                print(f"  {NAMES[direction]}: map edge")
+                walls[direction] = True
+                continue
+            if next_tile in visited:
+                walls[direction] = True
+                continue
+            result = try_move(tile, next_tile)
+            if result == OK:
+                walls[direction] = False
+                for d in candidates:          # the remaining side must be a wall
+                    walls.setdefault(d, True)
+                if not street or street[-1]["tile"] != tile:
+                    street.append({"tile": tile, "walls": walls})
+                tile, heading = next_tile, direction
+                moved = True
                 break
-
-        if next_heading is None:
-            print("Dead end: end of street.")
+            if result == BUMP:
+                walls[direction] = True
+                continue
+            print("Move failed - stopping mapping.")
+            if not street or street[-1]["tile"] != tile:
+                street.append({"tile": tile, "walls": walls})
             return street, None, False
 
-        next_tile = neighbour(tile, next_heading)
-        if not tile_in_bounds(next_tile):
-            print("Street reaches the map edge: end of street.")
+        if not moved:
+            if not street or street[-1]["tile"] != tile:
+                street.append({"tile": tile, "walls": walls})
+            print("Dead end / map edge: end of street.")
             return street, None, False
-        if next_tile in visited:
-            print("Next tile already visited: end of street.")
-            return street, None, False
-
-        heading = next_heading
-        if not go_to(tile_center(next_tile)):
-            print("Could not reach next tile - stopping mapping.")
-            return street, None, False
-        tile = next_tile
 
 
 def simplify_path(points):
@@ -467,10 +657,19 @@ def return_to_origin():
     path = simplify_path(list(reversed(trail)))
     print(f"\nReturning to origin via {len(path)} waypoints")
     for p in path[1:]:
-        go_to(p, record=False)
+        if go_to(p, record=False) == BUMP:
+            # Something is in the way: back off a little and try once more.
+            back_up_to((x - 5 * math.sin(math.radians(theta)),
+                        y - 5 * math.cos(math.radians(theta))))
+            go_to(p, record=False)
     go_to((0.0, 0.0), record=False)
     turn_to(START_HEADING)
     print_pose("Home: ")
+
+
+def serialisable(street):
+    return [{"tile": list(s["tile"]),
+             "walls": {str(h): w for h, w in s["walls"].items()}} for s in street]
 
 
 def run_phase1(s1, s2, d1, d2):
@@ -499,7 +698,7 @@ def run_phase1(s1, s2, d1, d2):
         "approach_tile": approach,
         "entry_tile": entry,
         "entry_heading": heading_in,
-        "street": street,                 # ordered from the entrance
+        "street": serialisable(street),   # ordered from the entrance
         "exit_tile": exit_tile,           # first open tile past the end, or None
         "street_length_tiles": len(street),
     }
