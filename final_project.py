@@ -119,8 +119,8 @@ leftmotor = Motor(LEFT_MOTOR_PORT)
 rightmotor = Motor(RIGHT_MOTOR_PORT)
 conveyor_motor = Motor(CONVEYOR_MOTOR_PORT)
 left_color = EV3ColorSensor(LEFT_COLOR_PORT)
-right_color = EV3ColorSensor(RIGHT_COLOR_PORT)
-us_sensor = EV3UltrasonicSensor(ULTRASONIC_PORT)
+right_color = NXTColorSensor(RIGHT_COLOR_PORT)
+us_sensor = UltrasonicSensor(ULTRASONIC_PORT)
 touch_sensor = TouchSensor(TOUCH_PORT)
 
 wait_ready_sensors()
@@ -742,8 +742,10 @@ if __name__ == "__main__":
         stop_motors()
         input("\nWaiting for facilitator. Press Enter to start Phase 2...")
         run_phase2(street_map)
-    except KeyboardInterrupt:
-        print("\nStopped by user.")
+    except BaseException:
+        stop_motors()
+        conveyor_motor.set_dps(0)
+        reset_brick()
     finally:
         stop_motors()
         conveyor_motor.set_dps(0)
